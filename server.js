@@ -1,9 +1,11 @@
-// Stock Rogue relay server — pairs two players by a 5-digit room code and
-// forwards their game messages to each other. No dependencies (plain Node 18+).
-//   Control messages (text JSON):  {"t":"host"} -> {"t":"room","code":"12345"}
-//                                  {"t":"join","code":"12345"} -> {"t":"paired"} to both
-//   Game messages (binary): forwarded untouched to the partner.
-//   When either side disconnects the other gets {"t":"left"}.
+// Stock Rogue relay server v2 — rooms of up to 4 players joined with a 5-digit code.
+// No dependencies (plain Node 18+).
+//   Control (text JSON):
+//     -> {"t":"host","max":4}            <- {"t":"room","code":"12345","slot":0}
+//     -> {"t":"join","code":"12345"}      <- {"t":"joined","slot":k}   (others get {"t":"peer_in","slot":k})
+//     -> {"t":"lock","on":true|false}     host only: stop / allow new joins (match in progress)
+//     <- {"t":"peer_out","slot":k}        someone left;  <- {"t":"host_left"} the host left (room closes)
+//   Game data (binary): forwarded to every other member, prefixed with 1 byte = sender slot.
 const http = require("http");
 const crypto = require("crypto");
 
@@ -24,7 +26,7 @@ server.on("upgrade", (req, socket) => {
   socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
     `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
   socket.setNoDelay(true);
-  const c = { id: nextId++, socket, buf: Buffer.alloc(0), frag: null, room: null, partner: null, alive: true, open: true };
+  const c = { id: nextId++, socket, buf: Buffer.alloc(0), frag: null, room: null, slot: -1, alive: true, open: true };
   socket.on("data", (d) => onData(c, d));
   socket.on("close", () => onClose(c));
   socket.on("error", () => socket.destroy());
@@ -82,10 +84,15 @@ function newCode() {
   return null;
 }
 
+function others(r, c) { return r.members.filter((m) => m && m !== c); }
+
 function onMessage(c, op, payload) {
   c.alive = true;
-  if (op === 0x2) { // game data: straight to the partner
-    if (c.partner) send(c.partner, 0x2, payload);
+  const r = c.room && rooms.get(c.room);
+  if (op === 0x2) { // game data: to everyone else, tagged with the sender's slot
+    if (!r) return;
+    const out = Buffer.concat([Buffer.from([c.slot]), payload]);
+    for (const m of others(r, c)) send(m, 0x2, out);
     return;
   }
   let m;
@@ -93,34 +100,50 @@ function onMessage(c, op, payload) {
   if (m.t === "host" && !c.room) {
     const code = newCode();
     if (!code) return sendJSON(c, { t: "err", msg: "Server is full, try again later" });
-    rooms.set(code, { host: c, guest: null });
-    c.room = code;
-    sendJSON(c, { t: "room", code });
-    log(`room ${code} opened by #${c.id}`);
+    const max = Math.max(2, Math.min(6, Number(m.max) || 2));
+    const members = new Array(max).fill(null);
+    members[0] = c;
+    rooms.set(code, { members, locked: false });
+    c.room = code; c.slot = 0;
+    sendJSON(c, { t: "room", code, slot: 0 });
+    log(`room ${code} opened by #${c.id} (max ${max})`);
   } else if (m.t === "join" && !c.room) {
     const code = String(m.code || "");
-    const r = rooms.get(code);
-    if (!r) return sendJSON(c, { t: "err", msg: `No room with code ${code}` });
-    if (r.guest) return sendJSON(c, { t: "err", msg: "That room is already full" });
-    r.guest = c; c.room = code; c.partner = r.host; r.host.partner = c;
-    sendJSON(r.host, { t: "paired" }); sendJSON(c, { t: "paired" });
-    log(`room ${code}: #${c.id} joined #${r.host.id}`);
+    const room = rooms.get(code);
+    if (!room) return sendJSON(c, { t: "err", msg: `No room with code ${code}` });
+    if (room.locked) return sendJSON(c, { t: "err", msg: "That room is in a match right now. Try again in a minute." });
+    const slot = room.members.indexOf(null);
+    if (slot < 0) return sendJSON(c, { t: "err", msg: "That room is full" });
+    room.members[slot] = c; c.room = code; c.slot = slot;
+    sendJSON(c, { t: "joined", slot });
+    for (const o of others(room, c)) sendJSON(o, { t: "peer_in", slot });
+    log(`room ${code}: #${c.id} joined as slot ${slot}`);
+  } else if (m.t === "lock" && r && c.slot === 0) {
+    r.locked = !!m.on;
   }
 }
 
 function onClose(c) {
   if (!c.open) return;
   c.open = false;
-  if (c.partner) { sendJSON(c.partner, { t: "left" }); c.partner.partner = null; }
   const r = c.room && rooms.get(c.room);
-  if (r && (r.host === c || r.guest === c)) { rooms.delete(c.room); log(`room ${c.room} closed`); }
+  if (!r) return;
+  r.members[c.slot] = null;
+  if (c.slot === 0) { // host left: close the room
+    for (const o of r.members) if (o) { sendJSON(o, { t: "host_left" }); o.room = null; }
+    rooms.delete(c.room);
+    log(`room ${c.room} closed (host left)`);
+  } else {
+    for (const o of r.members) if (o) sendJSON(o, { t: "peer_out", slot: c.slot });
+    log(`room ${c.room}: slot ${c.slot} left`);
+  }
 }
 
 function log(s) { console.log(new Date().toISOString(), s); }
 
 // drop dead connections (closed laptop, lost Wi-Fi) every 30 s
 setInterval(() => {
-  for (const r of rooms.values()) for (const c of [r.host, r.guest]) {
+  for (const r of rooms.values()) for (const c of r.members) {
     if (!c || !c.open) continue;
     if (!c.alive) { c.socket.destroy(); continue; }
     c.alive = false; send(c, 0x9, Buffer.alloc(0));
